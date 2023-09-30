@@ -2,10 +2,11 @@ import sys
 import serial
 import serial.tools.list_ports
 from serial.tools.list_ports_common import ListPortInfo
-from PyQt5 import uic, QtWidgets
-from PyQt5.QtCore import QObject, QThread, pyqtSignal
+from PySide6 import QtWidgets
+from PySide6.QtCore import QObject, QThread, Signal as pyqtSignal
+from PySide6.QtUiTools import QUiLoader
 from time import sleep
-from threading import Thread, Lock
+from threading import Thread, Lock, Event
 from queue import Queue
 from typing import Optional
 from os import path
@@ -376,6 +377,7 @@ class Controller:
         """Constructor method
         """
         self._app = QtWidgets.QApplication(sys.argv)
+        # self._app.aboutToQuit.connect(self.safe_exit)
         self._view = View(self)
         self._model = Model()
 
@@ -397,9 +399,9 @@ class Controller:
     def safe_exit(self):
         """Cleans up before exiting the application"""
         self._stop_com_port_update()
-        self._view.stop_periodic_update()
         self._stop_data_processing()
         self._model.disconnect()
+        self._view.stop_update_watcher()
 
     # Handlers
 
@@ -588,31 +590,27 @@ class UpdateQueueWatcher(QObject):
 
     :param queue: The queue to watch
     :type queue: Queue
-    :param finished: Signal emitted when the thread finishes
-    :type finished: pyqtSignal
     :param update_available: Signal emitted when an update is available
     :type update_available: pyqtSignal
     """
-    finished = pyqtSignal()
     update_available = pyqtSignal(tuple)
 
     def __init__(self, queue: Queue):
         """Constructor method
         """
-        super(QObject, self).__init__()
+        super(UpdateQueueWatcher, self).__init__()
         self.queue = queue
-        self._stop = False
 
     def run(self):
         """Watches the queue for updates and emits a signal with update data when available
         """
-        # TODO thread will not stop if queue is empty
-        while not self._stop:
+        while not self.thread().isInterruptionRequested():
             self.update_available.emit(self.queue.get())
-        self.finished.emit()
 
     def stop(self):
-        self._stop = True
+        self.thread().requestInterruption()
+        self.thread().quit()
+        self.thread().wait()
 
 class View:
     """A class containing the view of the application
@@ -633,7 +631,7 @@ class View:
         :type controller: Controller
         """
         self._controller = controller
-        self._window = uic.loadUi(path.abspath(path.join(path.dirname(__file__), 'powerMeter.ui')))
+        self._window = QUiLoader().load(path.abspath(path.join(path.dirname(__file__), 'powerMeter.ui')), None)
         self._update_queue = Queue()
         self._init_UI()
         self._start_update_watcher()
@@ -748,7 +746,7 @@ class View:
         :param duration: The duration of the status bar message in milliseconds (0 means infinite)
         :type duration: int
         """
-        self._window.statusBar.showMessage(text, duration)
+        self._window.statusBar().showMessage(text, duration)
 
     def get_selected_port(self) -> str:
         """Get the selected serial port
@@ -823,9 +821,6 @@ class View:
         self._update_watcher = UpdateQueueWatcher(self._update_queue)
         self._update_watcher.moveToThread(self._update_watcher_thread)
         self._update_watcher_thread.started.connect(self._update_watcher.run)
-        self._update_watcher.finished.connect(self._update_watcher_thread.quit)
-        self._update_watcher.finished.connect(self._update_watcher.deleteLater)
-        self._update_watcher_thread.finished.connect(self._update_watcher_thread.deleteLater)
 
         self._update_watcher.update_available.connect(self._update_queue_callback)
         self._update_watcher_thread.start()
@@ -840,9 +835,11 @@ class View:
         func, args = update
         func(*args)
 
-    def stop_periodic_update(self):
+    def stop_update_watcher(self):
         """Stops the update watcher thread
         """
+        # Adds an empty update to the queue to release queue.get() in the watcher thread
+        self.add_update(lambda: None)
         self._update_watcher.stop()
 
     def add_update(self, func: callable, *args: list):
