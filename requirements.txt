@@ -1,2 +1,2 @@
-PyQt5==5.15.9
 pyserial==3.5
+PySide6_Essentials==6.5.2
