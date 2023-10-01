@@ -1,0 +1,50 @@
+# More about this workflow: https://github.com/marketplace/actions/build-executables-or-extension-modules-from-python-projects
+name: Executable build
+
+on:
+  push:
+    branches: [ "qt6" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps: 
+      # Check-out repository
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      # Setup Python
+      - name: Set up python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          architecture: 'x64'
+          cache: 'pip'
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Build python script into a stand-alone exe
+      - name: Build
+        uses: Nuitka/Nuitka-Action@main
+        with:
+          script-name: power_meter.py
+          include-data-files: "./powerMeter.ui=powerMeter.ui"
+          onefile: true
+          enable-plugins: pyside6
+          disable-console: true
+          
+      # Uploads artifact
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ runner.os }} build
+          path: |
+            build/*.exe
+            build/*.bin
+            build/*.app/**/*
