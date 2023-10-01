@@ -5,11 +5,10 @@ from serial.tools.list_ports_common import ListPortInfo
 from PyQt5 import uic, QtWidgets
 from PyQt5.QtCore import QObject, QThread, pyqtSignal
 from time import sleep
-from threading import Thread, Lock
+from threading import Thread, Lock, Timer
 from queue import Queue
 from typing import Optional
 from os import path
-# import traceback
 
 class UpdateInterval:
     """An enum containing constant refresh rates
@@ -198,7 +197,7 @@ class Model:
         :rtype: bool
         """
         try:
-            self._serial_connection = serial.Serial(port, 460800)
+            self._serial_connection = serial.Serial(port, 460800, timeout=3)
         except:
             return False
         return True
@@ -219,8 +218,8 @@ class Model:
         # Increase update speed to get the configuration faster
         self.set_data_update_interval(UpdateInterval.FAST)
         # Values may not be received if serial input buffer is full
-        self._serial_connection.reset_input_buffer()
         try:
+            self._serial_connection.reset_input_buffer()
             self._serial_connection.write(b"Read\r\n")
             self._serial_connection.flush()
         except:
@@ -334,6 +333,8 @@ class Model:
         :rtype: tuple
         """
         raw_data = self._serial_connection.read_until(b"A").decode("utf-8")
+        if len(raw_data) == 0:
+            return None, None, None
         power_sum = 0.0
         power_dbm_sum = 0.0
         if raw_data[0] == 'a' and len(raw_data) >= 5000:
@@ -439,15 +440,19 @@ class Controller:
         """Tries to connect/disconnect to/from the power meter
         """
         if not self._model.is_connected():
-            self._stop_com_port_update()
             port = self._view.get_selected_port()
             if self._model.connect(port):
+                self._stop_com_port_update()
                 self._start_data_processing()
                 if not self._model.request_settings():
                     # Call the same function again, but this time disconnect will be executed
                     self.connect_btn_handler()
                     return
+                # For some reason the first request on device power on (first connect) is ignored (maybe my fault?)
+                # To be sure, we request the settings again after some time
+                Timer(0.5, self._model.request_settings).start()
                 self._view.notify(f"Connected to {port}", 3000)
+                self._view.set_connected(True)
                 self._view.enable_capture_section(True)
             else:
                 self._view.notify(f"Connection failed, try re-connecting the device", 3000)
@@ -458,7 +463,7 @@ class Controller:
             if self._model.get_capture_count() == 0:
                 self._view.enable_capture_section(False)
                 self._view.reset_export_btn_enabled(False)
-        self._view.set_connected(self._model.is_connected())
+            self._view.set_connected(False)
 
     def pause_btn_handler(self):
         """Pauses/resumes the data updates
@@ -599,7 +604,6 @@ class Controller:
             try:
                 data = self._model.read_and_parse()
             except:
-                # traceback.print_exc()
                 self._model.disconnect()
                 self._view.add_update(self._view.set_connected, False)
                 self._start_com_port_update()
@@ -717,9 +721,9 @@ class View:
         :param connected: Whether the power meter is connected or not
         :type connected: bool
         """
-        self.resume_updates(connected)
         self._window.connectBtn.setText("Disconnect" if connected else "Connect")
         self._window.comPorts.setEnabled(not connected)
+        self._window.resetStatsBtn.setEnabled(connected)
 
         self._window.pauseBtn.setEnabled(connected)
         self._window.updateSpeed.setEnabled(connected)
@@ -730,6 +734,7 @@ class View:
         self._window.frequencyLabel.setEnabled(connected)
         self._window.frequency.setEnabled(connected)
         self._window.applySettingsBtn.setEnabled(connected)
+        self._window.readSettingsBtn.setEnabled(connected)
 
     def set_ports_available(self, ports: list[str]):
         """Displays available serial ports
