@@ -9,6 +9,7 @@ from threading import Thread, Lock, Timer
 from queue import Queue
 from typing import Optional
 from os import path
+# import traceback
 
 class UpdateInterval:
     """An enum containing constant refresh rates
@@ -359,21 +360,27 @@ class Model:
                 power_sum += float(measurement[4:9]) / 100.0
             # Update all current power data simultaneously
             with self._current_power_lock:
-                self.current_power_dbm = float(power_sign + str(power_dbm_sum / float(valid)))
-                self.current_power = power_sum / float(valid)
-                self.current_power_unit = power_unit
+                # Probably overflow
+                if valid == 0:
+                    self.current_power_dbm = 60.0
+                    self.current_power = 999.99
+                    self.current_power_unit = "W"
+                else:
+                    self.current_power_dbm = float(power_sign + str(power_dbm_sum / float(valid)))
+                    self.current_power = power_sum / float(valid)
+                    self.current_power_unit = power_unit
             # Min/max values may be resetted anytime, so we need to lock them
             # Current values shouldn't be updated externally at this point, as they are private, so we don't need to lock them
             with self._min_max_lock:
                 if self.current_power_dbm > self.max_power_dbm:
                     self.max_power_dbm = self.current_power_dbm
                     self.max_power = self.current_power
-                    self.max_power_unit = power_unit
+                    self.max_power_unit = self.current_power_unit
                 if self.current_power_dbm < self.min_power_dbm:
                     self.min_power_dbm = self.current_power_dbm
                     self.min_power = self.current_power
-                    self.min_power_unit = power_unit
-            return self.current_power_dbm, self.current_power, power_unit
+                    self.min_power_unit = self.current_power_unit
+            return self.current_power_dbm, self.current_power, self.current_power_unit
         elif raw_data[0] == 'R' and len(raw_data) >= 10:
             separator = "+"
             if "-" in raw_data:
@@ -604,8 +611,12 @@ class Controller:
             try:
                 data = self._model.read_and_parse()
             except:
+                # traceback.print_exc()
                 self._model.disconnect()
                 self._view.add_update(self._view.set_connected, False)
+                if self._model.get_capture_count() == 0:
+                    self._view.add_update(self._view.enable_capture_section, False)
+                    self._view.add_update(self._view.reset_export_btn_enabled, False)
                 self._start_com_port_update()
                 self._data_processing_stop = True
                 continue
@@ -790,7 +801,6 @@ class View:
         """
         self._window.pauseBtn.setText("Pause updates" if resume else "Resume updates")
         self._window.readSettingsBtn.setEnabled(resume)
-        self._window.resetStatsBtn.setEnabled(resume)
 
     def notify(self, text: str, duration: int=0):
         """Sets status bar text (for a specified duration)
