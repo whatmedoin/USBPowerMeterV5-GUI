@@ -6,7 +6,7 @@ from PySide6 import QtWidgets
 from PySide6.QtCore import QObject, QThread, Signal as pyqtSignal
 from PySide6.QtUiTools import QUiLoader
 from time import sleep
-from threading import Thread, Lock, Event
+from threading import Thread, Lock, Timer
 from queue import Queue
 from typing import Optional
 from os import path
@@ -199,44 +199,51 @@ class Model:
         :rtype: bool
         """
         try:
-            self._serial_connection = serial.Serial(port, 460800)
+            self._serial_connection = serial.Serial(port, 460800, timeout=3)
         except:
             return False
         return True
     
-    def disconnect(self) -> bool:
+    def disconnect(self):
         """Disconnects from the power meter. THIS FUNCTION MAY BE CALLED BY AN EXTERNAL THREAD
-
-        :return: Whether the disconnection was successful or not
+        """
+        if self._serial_connection is not None:
+            self._serial_connection.close()
+            self._serial_connection = None
+    
+    def request_settings(self) -> bool:
+        """Requests the current configuration (frequency, attenuation) from the power meter
+        
+        :return: Whether the write was successful or not
         :rtype: bool
         """
-        try:
-            if self._serial_connection is not None:
-                self._serial_connection.close()
-                self._serial_connection = None
-        except:
-            return False
-        return True
-    
-    def request_settings(self):
-        """Requests the current configuration (frequency, attenuation) from the power meter"""
         # Increase update speed to get the configuration faster
         self.set_data_update_interval(UpdateInterval.FAST)
         # Values may not be received if serial input buffer is full
-        self._serial_connection.reset_input_buffer()
-        self._serial_connection.write(b"Read\r\n")
-        self._serial_connection.flush()
+        try:
+            self._serial_connection.reset_input_buffer()
+            self._serial_connection.write(b"Read\r\n")
+            self._serial_connection.flush()
+        except:
+            return False
+        return True
 
-    def set_settings(self, frequency: int, attenuation: float):
+    def set_settings(self, frequency: int, attenuation: float) -> bool:
         """Sets the configuration of the power meter. THIS FUNCTION IS SOMETIMES CALLED BY AN EXTERNAL THREAD.
         
         :param frequency: The frequency in MHz
         :type frequency: int
         :param attenuation: The attenuation in dBm
         :type attenuation: float
+        :return: Whether the write was successful or not
+        :rtype: bool
         """
-        self._serial_connection.write(f"A{frequency:04d}+{attenuation:.2f}\r\n".encode("utf-8"))
-        self._serial_connection.flush()
+        try:
+            self._serial_connection.write(f"A{frequency:04d}+{attenuation:.2f}\r\n".encode("utf-8"))
+            self._serial_connection.flush()
+        except:
+            return False
+        return True
 
     def get_next_captured_power_unit(self) -> str:
         """Returns the next power unit for captured values (uW -> mW -> W -> uW)
@@ -297,7 +304,29 @@ class Model:
                 self.captured_values[i][j][1] = self.captured_values[i][j][1] * multiply_factor
                 self.captured_values[i][j][2] = new_unit
         self._captured_values_unit = new_unit
-    
+
+    def export_captured(self, file_name: str) -> bool:
+        """Exports captured values into a file
+
+        :param file_name: The name of the file to export to
+        :type file_name: str
+        :return: Whether the export was successful or not
+        :rtype: bool
+        """
+        unit = self._captured_values_unit
+        try:
+            with open(file_name, 'w') as f:
+                f.write(f"Current (dBm),Current ({unit}),Min (dBm),Min ({unit}),Max (dBm),Max ({unit})\n")
+                out = []
+                for value_list in self.captured_values:
+                    for category_list in value_list:
+                        out.append(f"{category_list[0]:.2f}")
+                        out.append(f"{category_list[1]:.2f}")
+                f.write(",".join(out) + "\n")
+        except:
+            return False
+        return True
+        
     def read_and_parse(self) -> tuple[Optional[float|int], Optional[float], Optional[str]]:
         """Reads and parses serial data. THIS FUNCTION IS CALLED BY AN EXTERNAL THREAD
         
@@ -306,6 +335,8 @@ class Model:
         :rtype: tuple
         """
         raw_data = self._serial_connection.read_until(b"A").decode("utf-8")
+        if len(raw_data) == 0:
+            return None, None, None
         power_sum = 0.0
         power_dbm_sum = 0.0
         if raw_data[0] == 'a' and len(raw_data) >= 5000:
@@ -330,29 +361,38 @@ class Model:
                 power_sum += float(measurement[4:9]) / 100.0
             # Update all current power data simultaneously
             with self._current_power_lock:
-                self.current_power_dbm = float(power_sign + str(power_dbm_sum / float(valid)))
-                self.current_power = power_sum / float(valid)
-                self.current_power_unit = power_unit
+                # Probably overflow
+                if valid == 0:
+                    self.current_power_dbm = 60.0
+                    self.current_power = 999.99
+                    self.current_power_unit = "W"
+                else:
+                    self.current_power_dbm = float(power_sign + str(power_dbm_sum / float(valid)))
+                    self.current_power = power_sum / float(valid)
+                    self.current_power_unit = power_unit
             # Min/max values may be resetted anytime, so we need to lock them
             # Current values shouldn't be updated externally at this point, as they are private, so we don't need to lock them
             with self._min_max_lock:
                 if self.current_power_dbm > self.max_power_dbm:
                     self.max_power_dbm = self.current_power_dbm
                     self.max_power = self.current_power
-                    self.max_power_unit = power_unit
+                    self.max_power_unit = self.current_power_unit
                 if self.current_power_dbm < self.min_power_dbm:
                     self.min_power_dbm = self.current_power_dbm
                     self.min_power = self.current_power
-                    self.min_power_unit = power_unit
-            return self.current_power_dbm, self.current_power, power_unit
+                    self.min_power_unit = self.current_power_unit
+            return self.current_power_dbm, self.current_power, self.current_power_unit
         elif raw_data[0] == 'R' and len(raw_data) >= 10:
             separator = "+"
             if "-" in raw_data:
                 separator = "-"
-            sep_index = raw_data.index(separator)
-            frequency = int(raw_data[1:sep_index])
-            attenuation_dbm = float(raw_data[sep_index:10])
-            return frequency, attenuation_dbm, None
+            try:
+                sep_index = raw_data.index(separator)
+                frequency = int(raw_data[1:sep_index])
+                attenuation_dbm = float(raw_data[sep_index:10])
+                return frequency, attenuation_dbm, None
+            except:
+                pass
         return None, None, None
 
 class Controller:
@@ -409,20 +449,30 @@ class Controller:
         """Tries to connect/disconnect to/from the power meter
         """
         if not self._model.is_connected():
-            self._stop_com_port_update()
             port = self._view.get_selected_port()
-            self._model.connect(port)
-            self._model.request_settings()
-            self._start_data_processing()
-            self._view.notify(f"Connected to {port}", 3000)
-            self._view.enable_capture_section(True)
+            if self._model.connect(port):
+                self._stop_com_port_update()
+                self._start_data_processing()
+                if not self._model.request_settings():
+                    # Call the same function again, but this time disconnect will be executed
+                    self.connect_btn_handler()
+                    return
+                # For some reason the first request on device power on (first connect) is ignored (maybe my fault?)
+                # To be sure, we request the settings again after some time
+                Timer(0.5, self._model.request_settings).start()
+                self._view.notify(f"Connected to {port}", 3000)
+                self._view.set_connected(True)
+                self._view.enable_capture_section(True)
+            else:
+                self._view.notify(f"Connection failed, try re-connecting the device", 3000)
         else:
             self._stop_data_processing()
             self._model.disconnect()
             self._start_com_port_update()
             if self._model.get_capture_count() == 0:
                 self._view.enable_capture_section(False)
-        self._view.set_connected(self._model.is_connected())
+                self._view.reset_export_btn_enabled(False)
+            self._view.set_connected(False)
 
     def pause_btn_handler(self):
         """Pauses/resumes the data updates
@@ -448,6 +498,7 @@ class Controller:
         """
         self._model.clear_captured()
         self._view.reset_capture_table()
+        self._view.reset_export_btn_enabled(False)
         if not self._model.is_connected():
             self._view.enable_capture_section(False)
 
@@ -459,17 +510,31 @@ class Controller:
         index = self._model.add_capture(current_power, min_power, max_power)
         current_power_converted, min_power_converted, max_power_converted = self._model.get_capture(index)
         self._view.add_capture(current_power_converted, min_power_converted, max_power_converted)
+        self._view.reset_export_btn_enabled(True)
 
     def export_btn_handler(self):
         """Exports captured statistics into a file
         """
-        pass
+        choice = self._view.get_save_file_name()
+        file_name = choice[0]
+        if len(file_name) == 0:
+            return
+        elif choice[1] == "CSV (*.csv)" and not file_name.endswith(".csv"):
+            file_name = file_name + ".csv"
+        
+        if self._model.export_captured(file_name):
+            self._view.notify(f"Values exported to {file_name}", 3000)
+        else:
+            self._view.notify(f"Export failed, please try again or in another location", 3000)
 
     def apply_settings_btn_handler(self):
         """Applies the configuration to the power meter
         """
         frequency, attenuation = self._view.get_settings()
-        self._model.set_settings(frequency, attenuation)
+        if not self._model.set_settings(frequency, attenuation):
+            # Call disconnect
+            self.connect_btn_handler()
+            return
         self._view.notify("Configuration applied!", 3000)
 
     def read_settings_btn_handler(self):
@@ -551,9 +616,11 @@ class Controller:
                 # traceback.print_exc()
                 self._model.disconnect()
                 self._view.add_update(self._view.set_connected, False)
-                self._view.add_update(self._view.notify, "Connection lost!", 3000)
-                self._data_processing_stop = True
+                if self._model.get_capture_count() == 0:
+                    self._view.add_update(self._view.enable_capture_section, False)
+                    self._view.add_update(self._view.reset_export_btn_enabled, False)
                 self._start_com_port_update()
+                self._data_processing_stop = True
                 continue
             if data[0] is not None:
                 if data[2] is not None:
@@ -667,12 +734,11 @@ class View:
         :param connected: Whether the power meter is connected or not
         :type connected: bool
         """
-        self.resume_updates(connected)
         self._window.connectBtn.setText("Disconnect" if connected else "Connect")
         self._window.comPorts.setEnabled(not connected)
+        self._window.resetStatsBtn.setEnabled(connected)
 
         self._window.pauseBtn.setEnabled(connected)
-        self._window.resetStatsBtn.setEnabled(connected)
         self._window.updateSpeed.setEnabled(connected)
         self._window.updateSpeedLabel.setEnabled(connected)
 
@@ -681,6 +747,7 @@ class View:
         self._window.frequencyLabel.setEnabled(connected)
         self._window.frequency.setEnabled(connected)
         self._window.applySettingsBtn.setEnabled(connected)
+        self._window.readSettingsBtn.setEnabled(connected)
 
     def set_ports_available(self, ports: list[str]):
         """Displays available serial ports
@@ -736,7 +803,6 @@ class View:
         """
         self._window.pauseBtn.setText("Pause updates" if resume else "Resume updates")
         self._window.readSettingsBtn.setEnabled(resume)
-        self._window.resetStatsBtn.setEnabled(resume)
 
     def notify(self, text: str, duration: int=0):
         """Sets status bar text (for a specified duration)
@@ -779,6 +845,16 @@ class View:
             header = self._window.capturedValues.horizontalHeaderItem(i)
             header.setText(header.text().split(" ")[0] + " " + unit)
 
+    def get_save_file_name(self) -> str:
+        """Returns the file name to save captured values to
+
+        :return: The file name to save captured values to
+        :rtype: str
+        """
+        options = QtWidgets.QFileDialog.Options()
+        options |= QtWidgets.QFileDialog.DontUseNativeDialog
+        return QtWidgets.QFileDialog.getSaveFileName(None, "Save File", "", "CSV (*.csv);;All files (*)", options = options)
+
     def add_capture(self, current: list[float, float, str], min: list[float, float, str], max: list[float, float, str]):
         """Adds a new row to the captured values table
 
@@ -800,6 +876,7 @@ class View:
         self._window.capturedValues.setItem(row, 3, QtWidgets.QTableWidgetItem(f"{min_w:.2f}"))
         self._window.capturedValues.setItem(row, 4, QtWidgets.QTableWidgetItem(f"{max_dbm:.2f}"))
         self._window.capturedValues.setItem(row, 5, QtWidgets.QTableWidgetItem(f"{max_w:.2f}"))
+        self.reset_export_btn_enabled(True)
 
     def reset_capture_table(self, is_connected: bool=True):
         """Resets the captured values table
@@ -807,10 +884,22 @@ class View:
         self._window.capturedValues.setRowCount(0)
 
     def enable_capture_section(self, enable: bool):
+        """Enables/disables the capture section
+
+        :param enable: Whether to enable or disable the capture section
+        :type enable: bool
+        """
         self._window.captureBtn.setEnabled(enable)
-        self._window.exportBtn.setEnabled(enable)
         self._window.capturedValues.setEnabled(enable)
+
+    def reset_export_btn_enabled(self, enable: bool):
+        """Enables/disables the export and reset captures buttons
+
+        :param enable: Whether to enable or disable the buttons
+        :type enable: bool
+        """
         self._window.resetCapturedBtn.setEnabled(enable)
+        self._window.exportBtn.setEnabled(enable)
 
     # Thread logic
 
