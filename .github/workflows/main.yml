@@ -2,8 +2,8 @@
 name: Executable build
 
 on:
-  push:
-    branches: [ "qt6" ]
+  # push:
+  #   branches: [ "qt6" ]
   workflow_dispatch:
 
 jobs:
